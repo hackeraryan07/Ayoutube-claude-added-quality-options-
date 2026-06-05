@@ -32,13 +32,10 @@ import io.reactivex.rxjava3.functions.Consumer;
 
 /**
  * Full-screen ExoPlayer activity.
- * Uses DefaultHttpDataSource (not OkHttpDataSource) with a desktop User-Agent,
- * matching the approach used in the working MaterialTube reference project.
  *
- * Quality fix: when a StreamQuality has a non-null audioUrl it means the video
- * stream is video-only (DASH adaptive). ExoPlayer cannot play those alone — we
- * build a MergingMediaSource that combines the video track and the audio track
- * so all resolutions (480p, 720p, 1080p …) play with sound.
+ * startPlayback() handles two cases:
+ *   audioUrl == null → plain progressive stream, play directly with MediaItem
+ *   audioUrl != null → video-only DASH stream, merge with audio via MergingMediaSource
  */
 @SuppressWarnings("deprecation")   // setSystemUiVisibility on API 28
 public class PlayerActivity extends AppCompatActivity {
@@ -61,7 +58,6 @@ public class PlayerActivity extends AppCompatActivity {
     private ExoPlayer mPlayer;
     private VideoItem mVideo;
 
-    // Cached data source factory — reused for every MergingMediaSource build
     private DefaultHttpDataSource.Factory mDataSourceFactory;
 
     private List<YouTubeExtractorService.StreamQuality> mQualities;
@@ -75,7 +71,6 @@ public class PlayerActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // Fullscreen immersive — API 28 compatible
         getWindow().getDecorView().setSystemUiVisibility(
             View.SYSTEM_UI_FLAG_FULLSCREEN
             | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
@@ -130,7 +125,6 @@ public class PlayerActivity extends AppCompatActivity {
     // ── Player setup ──────────────────────────────────────────────────────
 
     private void buildPlayer() {
-        // Use DefaultHttpDataSource with desktop User-Agent — same as working MaterialTube project
         mDataSourceFactory = new DefaultHttpDataSource.Factory()
                 .setUserAgent(USER_AGENT)
                 .setAllowCrossProtocolRedirects(true);
@@ -200,25 +194,19 @@ public class PlayerActivity extends AppCompatActivity {
     }
 
     /**
-     * Start playback for the given StreamQuality.
-     *
-     * - If audioUrl is null  → plain progressive stream; use MediaItem directly.
-     * - If audioUrl non-null → video-only DASH stream; merge with audio track so
-     *                          the player gets both video and sound.
+     * audioUrl == null → progressive (video+audio in one URL), set as MediaItem directly.
+     * audioUrl != null → video-only DASH; merge video source + audio source via MergingMediaSource.
      */
     private void startPlayback(YouTubeExtractorService.StreamQuality quality) {
         if (mPlayer == null) return;
-        Log.d(TAG, "Playing [" + quality.label + "]: " +
-              quality.url.substring(0, Math.min(80, quality.url.length())));
+        Log.d(TAG, "Playing [" + quality.label + "] audioUrl=" +
+              (quality.audioUrl != null ? "set" : "null"));
 
         if (quality.audioUrl == null) {
-            // Progressive stream — video and audio are in one URL, no merging needed
+            // Progressive: one URL has both video and audio
             mPlayer.setMediaItem(MediaItem.fromUri(Uri.parse(quality.url)));
         } else {
-            // Video-only adaptive stream — must merge with a separate audio source
-            Log.d(TAG, "Merging audio: " +
-                  quality.audioUrl.substring(0, Math.min(80, quality.audioUrl.length())));
-
+            // DASH video-only: must merge a video source and an audio source
             MediaSource videoSource = new ProgressiveMediaSource.Factory(mDataSourceFactory)
                     .createMediaSource(MediaItem.fromUri(Uri.parse(quality.url)));
 
@@ -275,7 +263,6 @@ public class PlayerActivity extends AppCompatActivity {
                         updateQualityButton();
                         dialog.dismiss();
 
-                        // Save position and resume from same point at new quality
                         long position = mPlayer != null ? mPlayer.getCurrentPosition() : 0;
                         startPlayback(mQualities.get(which));
                         if (mPlayer != null && position > 0) {
