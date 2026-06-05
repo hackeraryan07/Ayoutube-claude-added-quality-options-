@@ -15,6 +15,9 @@ import androidx.media3.common.Player;
 import androidx.media3.datasource.DefaultHttpDataSource;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
+import androidx.media3.exoplayer.source.MediaSource;
+import androidx.media3.exoplayer.source.MergingMediaSource;
+import androidx.media3.exoplayer.source.ProgressiveMediaSource;
 import androidx.media3.ui.PlayerView;
 
 import com.example.myapp.extractor.YouTubeExtractorService;
@@ -31,6 +34,11 @@ import io.reactivex.rxjava3.functions.Consumer;
  * Full-screen ExoPlayer activity.
  * Uses DefaultHttpDataSource (not OkHttpDataSource) with a desktop User-Agent,
  * matching the approach used in the working MaterialTube reference project.
+ *
+ * Quality fix: when a StreamQuality has a non-null audioUrl it means the video
+ * stream is video-only (DASH adaptive). ExoPlayer cannot play those alone — we
+ * build a MergingMediaSource that combines the video track and the audio track
+ * so all resolutions (480p, 720p, 1080p …) play with sound.
  */
 @SuppressWarnings("deprecation")   // setSystemUiVisibility on API 28
 public class PlayerActivity extends AppCompatActivity {
@@ -52,6 +60,9 @@ public class PlayerActivity extends AppCompatActivity {
 
     private ExoPlayer mPlayer;
     private VideoItem mVideo;
+
+    // Cached data source factory — reused for every MergingMediaSource build
+    private DefaultHttpDataSource.Factory mDataSourceFactory;
 
     private List<YouTubeExtractorService.StreamQuality> mQualities;
     private int mSelectedQualityIndex = 0;
@@ -120,13 +131,12 @@ public class PlayerActivity extends AppCompatActivity {
 
     private void buildPlayer() {
         // Use DefaultHttpDataSource with desktop User-Agent — same as working MaterialTube project
-        DefaultHttpDataSource.Factory dataSourceFactory =
-            new DefaultHttpDataSource.Factory()
+        mDataSourceFactory = new DefaultHttpDataSource.Factory()
                 .setUserAgent(USER_AGENT)
                 .setAllowCrossProtocolRedirects(true);
 
         mPlayer = new ExoPlayer.Builder(this)
-            .setMediaSourceFactory(new DefaultMediaSourceFactory(dataSourceFactory))
+            .setMediaSourceFactory(new DefaultMediaSourceFactory(mDataSourceFactory))
             .build();
 
         mPlayerView.setPlayer(mPlayer);
@@ -172,7 +182,7 @@ public class PlayerActivity extends AppCompatActivity {
                             mQualities = qualities;
                             mSelectedQualityIndex = 0;
                             updateQualityButton();
-                            startPlayback(qualities.get(0).url);
+                            startPlayback(qualities.get(0));
                         }
                     },
                     new Consumer<Throwable>() {
@@ -189,10 +199,36 @@ public class PlayerActivity extends AppCompatActivity {
         );
     }
 
-    private void startPlayback(String url) {
+    /**
+     * Start playback for the given StreamQuality.
+     *
+     * - If audioUrl is null  → plain progressive stream; use MediaItem directly.
+     * - If audioUrl non-null → video-only DASH stream; merge with audio track so
+     *                          the player gets both video and sound.
+     */
+    private void startPlayback(YouTubeExtractorService.StreamQuality quality) {
         if (mPlayer == null) return;
-        Log.d(TAG, "Playing: " + url.substring(0, Math.min(80, url.length())));
-        mPlayer.setMediaItem(MediaItem.fromUri(Uri.parse(url)));
+        Log.d(TAG, "Playing [" + quality.label + "]: " +
+              quality.url.substring(0, Math.min(80, quality.url.length())));
+
+        if (quality.audioUrl == null) {
+            // Progressive stream — video and audio are in one URL, no merging needed
+            mPlayer.setMediaItem(MediaItem.fromUri(Uri.parse(quality.url)));
+        } else {
+            // Video-only adaptive stream — must merge with a separate audio source
+            Log.d(TAG, "Merging audio: " +
+                  quality.audioUrl.substring(0, Math.min(80, quality.audioUrl.length())));
+
+            MediaSource videoSource = new ProgressiveMediaSource.Factory(mDataSourceFactory)
+                    .createMediaSource(MediaItem.fromUri(Uri.parse(quality.url)));
+
+            MediaSource audioSource = new ProgressiveMediaSource.Factory(mDataSourceFactory)
+                    .createMediaSource(MediaItem.fromUri(Uri.parse(quality.audioUrl)));
+
+            MergingMediaSource merged = new MergingMediaSource(videoSource, audioSource);
+            mPlayer.setMediaSource(merged);
+        }
+
         mPlayer.prepare();
         mPlayer.setPlayWhenReady(true);
     }
@@ -241,7 +277,7 @@ public class PlayerActivity extends AppCompatActivity {
 
                         // Save position and resume from same point at new quality
                         long position = mPlayer != null ? mPlayer.getCurrentPosition() : 0;
-                        startPlayback(mQualities.get(which).url);
+                        startPlayback(mQualities.get(which));
                         if (mPlayer != null && position > 0) {
                             mPlayer.seekTo(position);
                         }

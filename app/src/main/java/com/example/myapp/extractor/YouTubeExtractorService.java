@@ -11,6 +11,7 @@ import org.schabi.newpipe.extractor.StreamingService;
 import org.schabi.newpipe.extractor.kiosk.KioskExtractor;
 import org.schabi.newpipe.extractor.search.SearchExtractor;
 import org.schabi.newpipe.extractor.stream.AudioStream;
+import org.schabi.newpipe.extractor.stream.DeliveryMethod;
 import org.schabi.newpipe.extractor.stream.StreamInfo;
 import org.schabi.newpipe.extractor.stream.StreamInfoItem;
 import org.schabi.newpipe.extractor.stream.VideoStream;
@@ -29,6 +30,11 @@ import io.reactivex.rxjava3.schedulers.Schedulers;
  * v0.24+ API changes applied:
  *  - getThumbnailUrl() removed → use getThumbnails().get(0).getUrl()
  *  - stream.content (was package-private) → use stream.getContent() (v0.26.2+)
+ *
+ * Quality fix:
+ *  - getVideoStreams() returns progressive streams only (≤360p on YouTube)
+ *  - getVideoOnlyStreams() returns DASH adaptive streams (480p, 720p, 1080p, etc.)
+ *  - Both are now included; video-only streams carry a separate audioUrl for merging in PlayerActivity
  */
 public class YouTubeExtractorService {
 
@@ -144,13 +150,21 @@ public class YouTubeExtractorService {
 
     // ── Quality Streams ───────────────────────────────────────────────────
 
+    /**
+     * Holds one quality option.
+     * - url      : the video stream URL
+     * - audioUrl : non-null when url is video-only (DASH); PlayerActivity must merge them.
+     *              null for progressive streams (video+audio in one URL).
+     */
     public static class StreamQuality {
         public final String label;
         public final String url;
+        public final String audioUrl; // null = progressive (no merge needed)
 
-        public StreamQuality(String label, String url) {
-            this.label = label;
-            this.url   = url;
+        public StreamQuality(String label, String url, String audioUrl) {
+            this.label    = label;
+            this.url      = url;
+            this.audioUrl = audioUrl;
         }
     }
 
@@ -169,19 +183,80 @@ public class YouTubeExtractorService {
 
         List<StreamQuality> result = new ArrayList<>();
 
-        // Progressive streams (video+audio) — most compatible
+        // ── Step 1: Find the best audio-only stream for merging with video-only streams ──
+        // YouTube's high-quality streams (480p+) are video-only DASH; they need a
+        // separate audio track merged in by ExoPlayer (MergingMediaSource).
+        String bestAudioUrl = null;
+        List<AudioStream> audioStreams = info.getAudioStreams();
+        if (audioStreams != null) {
+            int bestBitrate = 0;
+            for (AudioStream as : audioStreams) {
+                String u = as.getContent();
+                if (u == null || u.isEmpty()) continue;
+                // Prefer PROGRESSIVE_HTTP audio streams; they work best with ExoPlayer merging
+                if (as.getDeliveryMethod() != DeliveryMethod.PROGRESSIVE_HTTP) continue;
+                int br = as.getBitrate();
+                if (br > bestBitrate) {
+                    bestBitrate = br;
+                    bestAudioUrl = u;
+                }
+            }
+            // Fallback: accept any audio stream if no PROGRESSIVE_HTTP found
+            if (bestAudioUrl == null) {
+                for (AudioStream as : audioStreams) {
+                    String u = as.getContent();
+                    if (u != null && !u.isEmpty()) {
+                        bestAudioUrl = u;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // ── Step 2: Progressive streams (video+audio combined) — usually ≤360p ──
         List<VideoStream> progressive = info.getVideoStreams();
         if (progressive != null) {
             for (VideoStream vs : progressive) {
+                if (vs.getDeliveryMethod() != DeliveryMethod.PROGRESSIVE_HTTP) continue;
                 String u = vs.getContent();
                 if (u == null || u.isEmpty()) continue;
                 String res = vs.getResolution();
                 if (res == null || res.isEmpty()) res = "Unknown";
-                result.add(new StreamQuality(res + " (progressive)", u));
+                // audioUrl = null because this stream already has audio baked in
+                result.add(new StreamQuality(res, u, null));
             }
         }
 
-        // Sort by resolution descending (1080 > 720 > 480 …)
+        // ── Step 3: Video-only adaptive streams (DASH) — 480p, 720p, 1080p, 1440p, 2160p ──
+        // These are the streams YouTube actually serves for high qualities.
+        List<VideoStream> adaptive = info.getVideoOnlyStreams();
+        if (adaptive != null) {
+            for (VideoStream vs : adaptive) {
+                if (vs.getDeliveryMethod() != DeliveryMethod.PROGRESSIVE_HTTP) continue;
+                String u = vs.getContent();
+                if (u == null || u.isEmpty()) continue;
+                String res = vs.getResolution();
+                if (res == null || res.isEmpty()) res = "Unknown";
+                // Mark fps if available (e.g. "1080p60")
+                int fps = vs.getFps();
+                String label = (fps > 30) ? res + "p" + fps : res;
+                // audioUrl is required — ExoPlayer will merge video + audio
+                result.add(new StreamQuality(label, u, bestAudioUrl));
+            }
+        }
+
+        // ── Step 4: Deduplicate by resolution label, keeping first occurrence ──
+        List<StreamQuality> deduped = new ArrayList<>();
+        List<String> seen = new ArrayList<>();
+        for (StreamQuality sq : result) {
+            if (!seen.contains(sq.label)) {
+                seen.add(sq.label);
+                deduped.add(sq);
+            }
+        }
+        result = deduped;
+
+        // ── Step 5: Sort by resolution descending (2160 > 1080 > 720 > 480 > 360 …) ──
         Collections.sort(result, new Comparator<StreamQuality>() {
             @Override
             public int compare(StreamQuality a, StreamQuality b) {
@@ -189,10 +264,10 @@ public class YouTubeExtractorService {
             }
         });
 
-        // HLS as last option if available
+        // ── Step 6: HLS as final fallback (adaptive, auto quality) ──
         String hls = info.getHlsUrl();
         if (hls != null && !hls.isEmpty()) {
-            result.add(new StreamQuality("Auto (HLS)", hls));
+            result.add(new StreamQuality("Auto (HLS)", hls, null));
         }
 
         if (result.isEmpty()) {
