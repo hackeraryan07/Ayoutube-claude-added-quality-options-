@@ -1,0 +1,5 @@
+// Top-level build file. Plugin versions are declared in settings.gradle pluginManagement.
+
+task clean(type: Delete) {
+    delete rootProject.buildDir
+}
